@@ -10,9 +10,11 @@ Configuração necessária (uma vez só): ver README.md
 """
 import base64
 import io
+import json
 from datetime import datetime, timezone, timedelta
 
 import streamlit as st
+import streamlit.components.v1 as components
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -38,6 +40,28 @@ st.set_page_config(
     page_icon="♻️",
     layout="centered",
 )
+
+# Evita o erro "removeChild" causado pela tradução automática do navegador
+# (o Streamlit declara a página como inglês; o Chrome tenta traduzir e
+# quebra a árvore do React). Declaramos a página como pt-BR e sem tradução.
+components.html("""
+<script>
+  try {
+    const doc = window.parent.document;
+    doc.documentElement.setAttribute('lang', 'pt-BR');
+    doc.documentElement.setAttribute('translate', 'no');
+    doc.documentElement.classList.add('notranslate');
+    doc.body.setAttribute('translate', 'no');
+    doc.body.classList.add('notranslate');
+    if (!doc.querySelector('meta[name="google"][content="notranslate"]')) {
+      const meta = doc.createElement('meta');
+      meta.name = 'google';
+      meta.content = 'notranslate';
+      doc.head.appendChild(meta);
+    }
+  } catch (e) {}
+</script>
+""", height=0)
 
 # ----------------------------------------------------------------------
 # Visual — mesma identidade do protótipo anterior (verde, moderno, limpo)
@@ -76,9 +100,11 @@ st.markdown("""
 # ----------------------------------------------------------------------
 @st.cache_resource
 def obter_clientes_google():
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=SCOPES
-    )
+    bruto = st.secrets["gcp_service_account"]
+    # Aceita tanto o JSON colado inteiro (string, formato recomendado)
+    # quanto uma tabela TOML [gcp_service_account] campo a campo.
+    info = json.loads(bruto) if isinstance(bruto, str) else dict(bruto)
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     gc = gspread.authorize(creds)
     drive = build("drive", "v3", credentials=creds)
     return gc, drive
@@ -196,7 +222,8 @@ if "ultimo_recibo" not in st.session_state:
     st.session_state["ultimo_recibo"] = None
 
 try:
-    clientes = carregar_clientes()
+    with st.spinner("Carregando clientes..."):
+        clientes = carregar_clientes()
 except Exception as e:
     st.error(f"Não foi possível carregar os clientes da planilha agora. Detalhe: {e}")
     st.stop()
