@@ -11,6 +11,7 @@ Configuração necessária (uma vez só): ver README.md
 import base64
 import io
 import json
+from collections.abc import Mapping
 from datetime import datetime, timezone, timedelta
 
 import streamlit as st
@@ -21,7 +22,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 from streamlit_drawable_canvas import st_canvas
 from fpdf import FPDF
-from PIL import Image
+from PIL import Image, ImageOps
 
 # ----------------------------------------------------------------------
 # Configuração fixa
@@ -98,12 +99,42 @@ st.markdown("""
 # ----------------------------------------------------------------------
 # Conexão com Google (Conta de Serviço)
 # ----------------------------------------------------------------------
+def extrair_credenciais(segredos):
+    """Acha as credenciais do Google nos Secrets, aceitando vários jeitos de colar."""
+    def parece_credencial(d):
+        return "private_key" in d and "client_email" in d
+
+    # 1) formato esperado: gcp_service_account (tabela ou JSON colado inteiro)
+    if "gcp_service_account" in segredos:
+        bruto = segredos["gcp_service_account"]
+        if isinstance(bruto, str):
+            return json.loads(bruto, strict=False)
+        return dict(bruto)
+
+    # 2) campos colados soltos, sem o cabeçalho [gcp_service_account]
+    if parece_credencial(segredos):
+        return {k: segredos[k] for k in segredos.keys()}
+
+    # 3) qualquer entrada que contenha as credenciais (nome diferente)
+    for chave in segredos.keys():
+        valor = segredos[chave]
+        if isinstance(valor, Mapping) and parece_credencial(valor):
+            return dict(valor)
+        if isinstance(valor, str) and "private_key" in valor:
+            try:
+                return json.loads(valor, strict=False)
+            except ValueError:
+                pass
+
+    raise KeyError(
+        "Não encontrei as credenciais do Google nos Secrets. "
+        "Nomes encontrados: " + (", ".join(segredos.keys()) or "nenhum")
+    )
+
+
 @st.cache_resource
 def obter_clientes_google():
-    bruto = st.secrets["gcp_service_account"]
-    # Aceita tanto o JSON colado inteiro (string, formato recomendado)
-    # quanto uma tabela TOML [gcp_service_account] campo a campo.
-    info = json.loads(bruto) if isinstance(bruto, str) else dict(bruto)
+    info = extrair_credenciais(st.secrets)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     gc = gspread.authorize(creds)
     drive = build("drive", "v3", credentials=creds)
@@ -170,6 +201,30 @@ def formatar_data_hora(dt):
 # ----------------------------------------------------------------------
 # PDF do comprovante
 # ----------------------------------------------------------------------
+_TROCAS = str.maketrans({
+    "\u2013": "-", "\u2014": "-", "\u2018": "'", "\u2019": "'",
+    "\u201c": '"', "\u201d": '"', "\u2026": "...", "\u00a0": " ",
+})
+
+
+def texto_pdf(valor):
+    """A fonte padrão do PDF só aceita Latin-1: troca traços/aspas
+    especiais e substitui o que não couber (ex.: emojis) por '?'."""
+    texto = str(valor if valor is not None else "").translate(_TROCAS)
+    return texto.encode("latin-1", "replace").decode("latin-1")
+
+
+def preparar_foto(conteudo):
+    """Corrige a rotação da foto (EXIF), reduz o tamanho e converte para JPEG,
+    para o upload no Drive e o PDF ficarem leves."""
+    img = Image.open(io.BytesIO(conteudo))
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    img.thumbnail((1600, 1600))
+    saida = io.BytesIO()
+    img.save(saida, format="JPEG", quality=82)
+    return saida.getvalue()
+
+
 def gerar_pdf(dados, assinatura_png_bytes, foto_bytes=None):
     pdf = FPDF(unit="mm", format="A5")
     pdf.add_page()
@@ -189,13 +244,13 @@ def gerar_pdf(dados, assinatura_png_bytes, foto_bytes=None):
         ("Volume", f"{dados['volume']} L"),
         ("Grupo", dados["grupo"] or "-"),
         ("Data/hora", dados["data_hora"]),
-        ("Observacoes", dados["obs"] or "-"),
+        ("Observações", dados["obs"] or "-"),
     ]
     for rotulo, valor in linhas:
         pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(32, 6, f"{rotulo}:")
+        pdf.cell(32, 6, texto_pdf(f"{rotulo}:"))
         pdf.set_font("Helvetica", "", 10)
-        pdf.multi_cell(0, 6, str(valor))
+        pdf.multi_cell(0, 6, texto_pdf(valor), new_x="LMARGIN", new_y="NEXT")
 
     if foto_bytes:
         pdf.ln(2)
@@ -242,17 +297,22 @@ if st.session_state["ultimo_recibo"]:
       {r['dados']['data_hora']}
     </div>
     """, unsafe_allow_html=True)
-    st.download_button(
-        "Baixar PDF do comprovante",
-        data=r["pdf"],
-        file_name=f"canhoto_{r['dados']['id']}.pdf",
-        mime="application/pdf",
-        use_container_width=True,
-    )
+    if r["pdf"]:
+        st.download_button(
+            "Baixar PDF do comprovante",
+            data=r["pdf"],
+            file_name=f"canhoto_{r['dados']['id']}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+    else:
+        st.warning("A coleta foi gravada, mas não foi possível gerar o PDF do comprovante.")
     if st.button("Nova coleta", use_container_width=True):
         st.session_state["ultimo_recibo"] = None
         st.session_state["cliente_selecionado"] = None
         st.session_state["hora_abertura"] = None
+        st.session_state["foto_bytes"] = None
+        st.session_state["foto_mime"] = None
         st.rerun()
     st.stop()
 
@@ -262,16 +322,21 @@ if st.session_state["ultimo_recibo"]:
 st.subheader("Cliente")
 termo = st.text_input("Buscar por nome ou código", placeholder="Nome ou código...")
 
+incluir_inativos = st.checkbox("Incluir clientes inativos", value=False)
 filtrados = clientes
+if not incluir_inativos:
+    filtrados = [
+        c for c in clientes
+        if str(c.get("STATUS", "")).strip().upper() == "ATIVO"
+    ]
 if termo:
     termo_up = termo.strip().upper()
     filtrados = [
-        c for c in clientes
+        c for c in filtrados
         if termo_up in str(c.get("CÓDIGO", "")).upper()
         or termo_up in str(c.get("NOME PJ", "")).upper()
         or termo_up in str(c.get("NOME FANTASIA", "")).upper()
     ]
-filtrados = filtrados[:80]
 
 opcoes = {f'{c["CÓDIGO"]} — {c["NOME PJ"]}': c for c in filtrados}
 escolha = st.selectbox(
@@ -313,9 +378,41 @@ with col2:
 obs = st.text_area("Observações", placeholder="Ex.: coleta normal, estabelecimento fechado, excedente, irregularidade...")
 
 st.subheader("Foto (opcional)")
-foto_camera = st.camera_input("Tirar foto")
-foto_arquivo = st.file_uploader("...ou escolher da galeria", type=["jpg", "jpeg", "png"])
-foto_final = foto_camera or foto_arquivo
+if st.session_state.get("foto_bytes"):
+    st.image(st.session_state["foto_bytes"], width=220)
+    if st.button("Remover foto"):
+        st.session_state["foto_bytes"] = None
+        st.session_state["foto_mime"] = None
+        st.rerun()
+else:
+    modo_foto = st.radio(
+        "Como registrar a foto?",
+        ["Sem foto", "Tirar foto agora", "Escolher da galeria"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    # A câmera só é criada quando escolhida; ao tirar a foto guardamos o
+    # arquivo e recarregamos, o que desliga a câmera.
+    if modo_foto == "Tirar foto agora":
+        foto_camera = st.camera_input("Tirar foto", label_visibility="collapsed")
+        if foto_camera is not None:
+            try:
+                st.session_state["foto_bytes"] = preparar_foto(foto_camera.getvalue())
+                st.session_state["foto_mime"] = "image/jpeg"
+                st.rerun()
+            except Exception as e:
+                st.error(f"Não foi possível usar essa foto. Detalhe: {e}")
+    elif modo_foto == "Escolher da galeria":
+        foto_arquivo = st.file_uploader(
+            "Escolher da galeria", type=["jpg", "jpeg", "png"], label_visibility="collapsed"
+        )
+        if foto_arquivo is not None:
+            try:
+                st.session_state["foto_bytes"] = preparar_foto(foto_arquivo.getvalue())
+                st.session_state["foto_mime"] = "image/jpeg"
+                st.rerun()
+            except Exception as e:
+                st.error(f"Não foi possível usar essa foto. Detalhe: {e}")
 
 st.subheader("Assinatura do gerador")
 st.caption("Assine com o dedo dentro do quadro.")
@@ -339,6 +436,8 @@ if finalizar:
     elif tela_assinatura.image_data is None:
         st.error("Colete a assinatura do gerador.")
     else:
+        canhoto = None
+        gravou = False
         with st.spinner("Salvando na planilha..."):
             try:
                 agora_dt = agora()
@@ -355,11 +454,12 @@ if finalizar:
                 prefixo = f"canhoto_{canhoto}_cod{cliente['CÓDIGO']}_"
                 link_assinatura = subir_para_drive(prefixo + "assinatura.png", assinatura_bytes, "image/png")
 
-                foto_bytes = None
+                foto_bytes = st.session_state.get("foto_bytes")
                 link_foto = ""
-                if foto_final is not None:
-                    foto_bytes = foto_final.getvalue()
-                    link_foto = subir_para_drive(prefixo + "foto.jpg", foto_bytes, "image/jpeg")
+                if foto_bytes:
+                    mime_foto = st.session_state.get("foto_mime") or "image/jpeg"
+                    extensao = "png" if mime_foto == "image/png" else "jpg"
+                    link_foto = subir_para_drive(prefixo + "foto." + extensao, foto_bytes, mime_foto)
 
                 hora_abertura = st.session_state["hora_abertura"] or agora_dt
                 nova_linha = [
@@ -375,7 +475,10 @@ if finalizar:
                     link_assinatura,
                     link_foto,
                 ]
-                planilha().worksheet("BD_COLETAS").append_row(nova_linha, value_input_option="USER_ENTERED")
+                # RAW: grava o texto exatamente como veio (sem interpretar fórmulas),
+                # já que o app é público e o campo de observações é livre.
+                planilha().worksheet("BD_COLETAS").append_row(nova_linha, value_input_option="RAW")
+                gravou = True
 
                 dados_recibo = {
                     "id": canhoto,
@@ -386,9 +489,14 @@ if finalizar:
                     "obs": obs,
                     "data_hora": formatar_data_hora(agora_dt),
                 }
-                pdf_bytes = gerar_pdf(dados_recibo, assinatura_bytes, foto_bytes)
+                try:
+                    pdf_bytes = gerar_pdf(dados_recibo, assinatura_bytes, foto_bytes)
+                except Exception:
+                    pdf_bytes = None  # a coleta já está gravada; só o PDF não saiu
 
                 st.session_state["ultimo_recibo"] = {"dados": dados_recibo, "pdf": pdf_bytes}
                 st.rerun()
             except Exception as e:
+                if not gravou and canhoto is not None:
+                    st.session_state["proximo_id"] = canhoto  # devolve o número, não houve gravação
                 st.error(f"Não foi possível gravar na planilha agora. Detalhe: {e}")
