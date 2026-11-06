@@ -17,9 +17,8 @@ from datetime import datetime, timezone, timedelta
 import streamlit as st
 import streamlit.components.v1 as components
 import gspread
+import requests
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 from streamlit_drawable_canvas import st_canvas
 from fpdf import FPDF
 from PIL import Image, ImageOps
@@ -28,13 +27,11 @@ from PIL import Image, ImageOps
 # Configuração fixa
 # ----------------------------------------------------------------------
 SHEET_ID = "1skzK1B-OkNG7uyTku2904dthtn9Wc0RllMSHJTYgCQY"
-DRIVE_PASTA_ANEXOS = "1jTpq6aZQmizpqCLBGzDpTtjcWs5uvAh2"  # "LRS Canhoto Digital - Anexos"
 FUSO = timezone(timedelta(hours=-3))  # América/Sao_Paulo (sem horário de verão)
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
+# A conta de serviço só mexe na planilha. Assinatura e foto vão para o Drive
+# por um Apps Script rodando na conta da empresa (ver apps_script_Code.gs).
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 st.set_page_config(
     page_title="LRS Canhoto Digital",
@@ -81,6 +78,7 @@ st.markdown("""
 .cabecalho-lrs p{font-size:12.5px;margin:2px 0 0;opacity:.9}
 div[data-testid="stForm"]{background:#fff;border-radius:16px;padding:18px;box-shadow:0 1px 2px rgba(16,24,20,.05),0 8px 20px rgba(16,24,20,.06);}
 .cartao-cliente{background:var(--verde-suave);border-radius:14px;padding:14px;margin:8px 0 4px}
+.cartao-cliente, .cartao-cliente b{color:#151B18}
 .cartao-cliente b{font-size:15px}
 .stButton>button, .stDownloadButton>button{
   border-radius:12px;font-weight:700;padding:.6rem 1rem;
@@ -136,13 +134,11 @@ def extrair_credenciais(segredos):
 def obter_clientes_google():
     info = extrair_credenciais(st.secrets)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    gc = gspread.authorize(creds)
-    drive = build("drive", "v3", credentials=creds)
-    return gc, drive
+    return gspread.authorize(creds)
 
 
 def planilha():
-    gc, _ = obter_clientes_google()
+    gc = obter_clientes_google()
     return gc.open_by_key(SHEET_ID)
 
 
@@ -176,14 +172,32 @@ def proximo_id_coleta():
 
 
 def subir_para_drive(nome_arquivo, conteudo_bytes, mime_type):
-    _, drive = obter_clientes_google()
-    media = MediaIoBaseUpload(io.BytesIO(conteudo_bytes), mimetype=mime_type, resumable=False)
-    arquivo = drive.files().create(
-        body={"name": nome_arquivo, "parents": [DRIVE_PASTA_ANEXOS]},
-        media_body=media,
-        fields="id, webViewLink",
-    ).execute()
-    return arquivo.get("webViewLink", "")
+    """Envia o arquivo para um Apps Script da conta da empresa, que salva na
+    pasta do Drive (o arquivo fica no espaço da conta, não da conta robô)."""
+    url = st.secrets.get("apps_script_url")
+    token = st.secrets.get("apps_script_token")
+    if not url or not token:
+        raise RuntimeError("envio para o Drive ainda não configurado nos Secrets")
+    resposta = requests.post(
+        url,
+        json={
+            "token": token,
+            "nome": nome_arquivo,
+            "mime": mime_type,
+            "conteudo_base64": base64.b64encode(conteudo_bytes).decode("ascii"),
+        },
+        timeout=90,
+    )
+    try:
+        dados = resposta.json()
+    except ValueError:
+        raise RuntimeError(
+            "o Apps Script não respondeu como esperado (confira se a implantação "
+            "está com acesso 'Qualquer pessoa')"
+        )
+    if not dados.get("ok"):
+        raise RuntimeError(dados.get("erro") or "o Apps Script recusou o envio")
+    return dados.get("link", "")
 
 
 def agora():
@@ -297,6 +311,8 @@ if st.session_state["ultimo_recibo"]:
       {r['dados']['data_hora']}
     </div>
     """, unsafe_allow_html=True)
+    for aviso in r.get("avisos", []):
+        st.warning(aviso + " Baixe o PDF e guarde uma cópia.")
     if r["pdf"]:
         st.download_button(
             "Baixar PDF do comprovante",
@@ -452,14 +468,20 @@ if finalizar:
                 assinatura_bytes = buffer_assinatura.getvalue()
 
                 prefixo = f"canhoto_{canhoto}_cod{cliente['CÓDIGO']}_"
-                link_assinatura = subir_para_drive(prefixo + "assinatura.png", assinatura_bytes, "image/png")
+                avisos = []
+                link_assinatura = ""
+                try:
+                    link_assinatura = subir_para_drive(prefixo + "assinatura.png", assinatura_bytes, "image/png")
+                except Exception as e:
+                    avisos.append(f"A assinatura não subiu para o Drive ({e}).")
 
                 foto_bytes = st.session_state.get("foto_bytes")
                 link_foto = ""
                 if foto_bytes:
-                    mime_foto = st.session_state.get("foto_mime") or "image/jpeg"
-                    extensao = "png" if mime_foto == "image/png" else "jpg"
-                    link_foto = subir_para_drive(prefixo + "foto." + extensao, foto_bytes, mime_foto)
+                    try:
+                        link_foto = subir_para_drive(prefixo + "foto.jpg", foto_bytes, "image/jpeg")
+                    except Exception as e:
+                        avisos.append(f"A foto não subiu para o Drive ({e}).")
 
                 hora_abertura = st.session_state["hora_abertura"] or agora_dt
                 nova_linha = [
@@ -494,7 +516,7 @@ if finalizar:
                 except Exception:
                     pdf_bytes = None  # a coleta já está gravada; só o PDF não saiu
 
-                st.session_state["ultimo_recibo"] = {"dados": dados_recibo, "pdf": pdf_bytes}
+                st.session_state["ultimo_recibo"] = {"dados": dados_recibo, "pdf": pdf_bytes, "avisos": avisos}
                 st.rerun()
             except Exception as e:
                 if not gravou and canhoto is not None:
