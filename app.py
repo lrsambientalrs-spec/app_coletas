@@ -9,13 +9,14 @@ coletor). Assinatura e foto sobem para uma pasta no Google Drive.
 Configuração necessária (uma vez só): ver README.md
 """
 import base64
+import html
 import io
 import json
 import re
 import unicodedata
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from urllib.parse import quote
 
 import streamlit as st
@@ -89,6 +90,10 @@ st.markdown("""
 .cabecalho-lrs p{font-size:12.5px;margin:2px 0 0;opacity:.9}
 div[data-testid="stForm"]{background:#fff;border-radius:16px;padding:18px;box-shadow:0 1px 2px rgba(16,24,20,.05),0 8px 20px rgba(16,24,20,.06);}
 .cartao-cliente{background:var(--verde-suave);border-radius:14px;padding:14px;margin:8px 0 4px}
+.rotulo-dia{text-align:center;font-weight:700;padding-top:.55rem;color:#151B18}
+/* mantém as colunas lado a lado no celular (setas do dia, volume/grupo) */
+div[data-testid="stHorizontalBlock"]{flex-wrap:nowrap !important;gap:.5rem}
+div[data-testid="column"]{min-width:0 !important;flex:1 1 0 !important;width:auto !important}
 .cartao-cliente, .cartao-cliente b{color:#151B18}
 .cartao-cliente b{font-size:15px}
 .stButton>button, .stDownloadButton>button{
@@ -288,6 +293,105 @@ def carregar_agenda_do_dia(data_iso, agenda_id):
     return eventos
 
 
+DIAS_SEMANA = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
+
+
+def rotulo_dia(dia, hoje):
+    base = f"{DIAS_SEMANA[dia.weekday()]}, {dia.strftime('%d/%m')}"
+    if dia == hoje:
+        return f"Hoje · {base}"
+    if dia == hoje + timedelta(days=1):
+        return f"Amanhã · {base}"
+    if dia == hoje - timedelta(days=1):
+        return f"Ontem · {base}"
+    return base
+
+
+def formatar_litros(valor):
+    return f"{valor:g}".replace(".", ",")
+
+
+def numero_br(texto):
+    try:
+        return float(str(texto).strip().replace(",", "."))
+    except ValueError:
+        return 0.0
+
+
+def datas_possiveis(texto):
+    """A planilha mistura 'dd/mm/aaaa' (texto) e datas reais em 'm/d/aaaa'.
+    Devolve as datas que o texto pode representar."""
+    texto = str(texto or "").strip()
+    achadas = set()
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})", texto)
+    if m:
+        a, b, ano = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        for dia, mes in ((a, b), (b, a)):
+            try:
+                achadas.add(date(ano, mes, dia))
+            except ValueError:
+                pass
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", texto)
+    if m:
+        try:
+            achadas.add(date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+        except ValueError:
+            pass
+    return achadas
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def registros_do_dia(data_iso):
+    """Registros da BD_COLETAS num dia, por código de cliente. Lê só o final da
+    planilha (as últimas ~150 linhas), para não pesar."""
+    aba = planilha().worksheet("BD_COLETAS")
+    ultima = len(aba.col_values(1))
+    if ultima < 3:
+        return {}
+    alvo = date.fromisoformat(data_iso)
+    linhas = aba.get(f"A{max(3, ultima - 150)}:I{ultima}")
+    por_cliente = {}
+    for linha in linhas:
+        linha = list(linha) + [""] * (9 - len(linha))
+        if alvo not in datas_possiveis(linha[1]) or not str(linha[2]).strip():
+            continue
+        hora = re.search(r"(\d{1,2}:\d{2})\s*$", str(linha[8]))
+        por_cliente.setdefault(normalizar_codigo(linha[2]), []).append({
+            "volume": numero_br(linha[4]),
+            "obs": str(linha[6]).strip(),
+            "hora": hora.group(1) if hora else "",
+        })
+    return por_cliente
+
+
+def registros_seguro(data_iso):
+    try:
+        return registros_do_dia(data_iso)
+    except Exception:
+        return {}
+
+
+def montar_obs_sem_coleta(motivo, obs_digitada, visitas_sem_coleta_antes):
+    obs_digitada = (obs_digitada or "").strip()
+    if motivo == "Outro motivo":
+        return obs_digitada
+    texto = "FECHADO"
+    if visitas_sem_coleta_antes:
+        texto += f" {visitas_sem_coleta_antes + 1}ª VISITA"
+    if obs_digitada:
+        texto += f" - {obs_digitada}"
+    return texto
+
+
+def mudar_dia(delta):
+    atual = date.fromisoformat(st.session_state["agenda_data"])
+    st.session_state["agenda_data"] = (atual + timedelta(days=delta)).isoformat()
+
+
+def voltar_hoje():
+    st.session_state["agenda_data"] = agora().date().isoformat()
+
+
 def escolher_pela_agenda(codigo):
     st.session_state["cliente_agenda"] = normalizar_codigo(codigo)
 
@@ -379,6 +483,8 @@ if "cliente_selecionado" not in st.session_state:
     st.session_state["cliente_selecionado"] = None
 if "hora_abertura" not in st.session_state:
     st.session_state["hora_abertura"] = None
+if "agenda_data" not in st.session_state:
+    st.session_state["agenda_data"] = agora().date().isoformat()
 if "ultimo_recibo" not in st.session_state:
     st.session_state["ultimo_recibo"] = None
 
@@ -394,15 +500,25 @@ except Exception as e:
 # ----------------------------------------------------------------------
 if st.session_state["ultimo_recibo"]:
     r = st.session_state["ultimo_recibo"]
-    st.success(f"Coleta #{r['dados']['id']} gravada na planilha.")
-    st.markdown(f"""
-    <div class="cartao-cliente">
-      <b>Canhoto nº {r['dados']['id']}</b><br>
-      {r['dados']['cliente']}<br>
-      {r['dados']['volume']} L · Grupo {r['dados']['grupo'] or '-'}<br>
-      {r['dados']['data_hora']}
-    </div>
-    """, unsafe_allow_html=True)
+    if r["dados"].get("sem_coleta"):
+        st.success(f"Visita sem coleta #{r['dados']['id']} registrada na planilha.")
+        st.markdown(f"""
+        <div class="cartao-cliente">
+          <b>{html.escape(str(r['dados']['cliente']))}</b><br>
+          Sem coleta: {html.escape(str(r['dados']['obs']))}<br>
+          {r['dados']['data_hora']}
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.success(f"Coleta #{r['dados']['id']} gravada na planilha.")
+        st.markdown(f"""
+        <div class="cartao-cliente">
+          <b>Canhoto nº {r['dados']['id']}</b><br>
+          {r['dados']['cliente']}<br>
+          {r['dados']['volume']} L · Grupo {r['dados']['grupo'] or '-'}<br>
+          {r['dados']['data_hora']}
+        </div>
+        """, unsafe_allow_html=True)
     if r.get("pdf_salvo"):
         st.info("O canhoto (PDF) foi salvo na pasta do Drive.")
     for aviso in r.get("avisos", []):
@@ -429,6 +545,10 @@ if st.session_state["ultimo_recibo"]:
 # ----------------------------------------------------------------------
 # Seleção de cliente
 # ----------------------------------------------------------------------
+hoje_iso = agora().date().isoformat()
+registros_hoje = registros_seguro(hoje_iso)
+
+
 def achar_cliente(codigo):
     if not codigo:
         return None
@@ -439,33 +559,63 @@ cliente = achar_cliente(st.session_state.get("cliente_agenda"))
 if cliente is None:
     st.session_state["cliente_agenda"] = None
 
-    # ---- Coletas previstas para hoje (Google Agenda) ----
-    st.subheader("Coletas previstas para hoje")
+    # ---- Coletas previstas (Google Agenda), com navegação entre os dias ----
+    hoje = agora().date()
+    dia = date.fromisoformat(st.session_state["agenda_data"])
+    st.subheader("Coletas previstas")
+    col_ant, col_dia, col_prox = st.columns([1, 3, 1])
+    col_ant.button("◀", key="dia_anterior", on_click=mudar_dia, args=(-1,), use_container_width=True)
+    col_dia.markdown(f'<div class="rotulo-dia">{rotulo_dia(dia, hoje)}</div>', unsafe_allow_html=True)
+    col_prox.button("▶", key="dia_seguinte", on_click=mudar_dia, args=(1,), use_container_width=True)
+    if dia != hoje:
+        st.button("Voltar para hoje", key="voltar_hoje", on_click=voltar_hoje, use_container_width=True)
     try:
         try:
             agenda_id = st.secrets.get("agenda_id") or AGENDA_CLIENTES_ID
         except Exception:
             agenda_id = AGENDA_CLIENTES_ID
-        eventos = carregar_agenda_do_dia(agora().strftime("%Y-%m-%d"), agenda_id)
+        eventos = carregar_agenda_do_dia(dia.isoformat(), agenda_id)
+        if dia == hoje:
+            marcas = registros_hoje
+        elif dia < hoje:
+            marcas = registros_seguro(dia.isoformat())
+        else:
+            marcas = {}  # dia futuro: ainda não há o que marcar
         previstos, sem_cadastro = [], []
         for ev in eventos:
             cli = achar_cliente(ev["codigo"]) if ev["codigo"] else None
             (previstos if cli else sem_cadastro).append((ev, cli))
         if not eventos:
-            st.caption("Nenhuma coleta agendada para hoje na agenda.")
+            st.caption("Nenhuma coleta agendada neste dia.")
+        feitas = 0
         for i, (ev, cli) in enumerate(previstos):
-            rotulo = f'{cli["CÓDIGO"]} — {cli["NOME PJ"]}'
-            if ev["hora"]:
-                rotulo = f'{ev["hora"]}  ·  {rotulo}'
+            regs = marcas.get(normalizar_codigo(cli["CÓDIGO"]), [])
+            coletou = [r for r in regs if r["volume"] > 0]
+            base = f'{cli["CÓDIGO"]} — {cli["NOME PJ"]}'
+            hora = f'{ev["hora"]} · ' if ev["hora"] else ""
+            if coletou:
+                feitas += 1
+                rotulo = f'✅ {hora}{base} · {formatar_litros(sum(r["volume"] for r in coletou))} L'
+                tipo = "secondary"
+            elif regs:
+                rotulo = f'↩ {hora}{base} · {(regs[-1]["obs"] or "sem coleta")[:22]}'
+                tipo = "secondary"
+            else:
+                rotulo = f"{hora}{base}"
+                tipo = "primary"
             st.button(
-                rotulo, key=f"agenda_{i}_{cli['CÓDIGO']}", use_container_width=True,
+                rotulo, key=f"agenda_{i}_{cli['CÓDIGO']}", type=tipo, use_container_width=True,
                 on_click=escolher_pela_agenda, args=(cli["CÓDIGO"],),
             )
+        if previstos and dia <= hoje:
+            st.caption(f"{feitas} de {len(previstos)} coletas realizadas · ↩ = visita sem coleta, precisa voltar")
+        elif previstos:
+            st.caption("Antecipando uma coleta de outro dia: ela será registrada com a data de hoje.")
         for ev, _ in sem_cadastro:
             st.caption(f'Na agenda, sem cadastro no sistema: {ev["titulo"]}')
     except Exception:
         st.caption(
-            "Não consegui ler a agenda de hoje. Se for a primeira vez, confira se a agenda "
+            "Não consegui ler a agenda deste dia. Se for a primeira vez, confira se a agenda "
             "'LRS CLIENTES' foi compartilhada com a conta de serviço."
         )
 
@@ -519,20 +669,43 @@ if cliente:
       </span>
     </div>
     """, unsafe_allow_html=True)
+    regs_cliente = registros_hoje.get(normalizar_codigo(cliente["CÓDIGO"]), [])
+    if regs_cliente:
+        coletado = [r for r in regs_cliente if r["volume"] > 0]
+        if coletado:
+            st.info(
+                f"Hoje já foi registrada coleta deste cliente: "
+                f"{formatar_litros(sum(r['volume'] for r in coletado))} L. "
+                "Uma nova coleta será um novo registro."
+            )
+        else:
+            st.warning(
+                f"Hoje houve visita sem coleta deste cliente ({regs_cliente[-1]['obs'] or 'sem motivo'}). "
+                "Esta será uma nova visita."
+            )
 
 st.divider()
 
 # ----------------------------------------------------------------------
 # Formulário da coleta
 # ----------------------------------------------------------------------
-st.subheader("Dados da coleta")
-col1, col2 = st.columns(2)
-with col1:
-    volume = st.number_input("Volume coletado (L)", min_value=0.0, step=1.0, format="%.1f")
-with col2:
-    grupo = st.selectbox("Grupo de resíduo", ["", "A", "B", "E", "A-E", "A-B", "A-B-E", "Outros"])
-
-obs = st.text_area("Observações", placeholder="Ex.: coleta normal, estabelecimento fechado, excedente, irregularidade...")
+sem_coleta = st.toggle("Não houve coleta nesta visita (fechado etc.)")
+motivo = None
+if sem_coleta:
+    st.subheader("Visita sem coleta")
+    motivo = st.radio("Motivo", ["Fechado", "Outro motivo"], horizontal=True)
+    volume, grupo = 0.0, ""
+    obs = st.text_area(
+        "Observações", placeholder="Se for 'Outro motivo', descreva aqui o que aconteceu."
+    )
+else:
+    st.subheader("Dados da coleta")
+    col1, col2 = st.columns(2)
+    with col1:
+        volume = st.number_input("Volume coletado (L)", min_value=0.0, step=1.0, format="%.1f")
+    with col2:
+        grupo = st.selectbox("Grupo de resíduo", ["", "A", "B", "E", "A-E", "A-B", "A-B-E", "Outros"])
+    obs = st.text_area("Observações", placeholder="Ex.: coleta normal, excedente, irregularidade...")
 
 st.subheader("Foto (opcional)")
 if st.session_state.get("foto_bytes"):
@@ -571,66 +744,89 @@ else:
             except Exception as e:
                 st.error(f"Não foi possível usar essa foto. Detalhe: {e}")
 
-st.subheader("Assinatura do gerador")
-st.caption("Assine com o dedo dentro do quadro.")
-tela_assinatura = st_canvas(
-    stroke_width=3,
-    stroke_color="#000000",
-    background_color="#FFFFFF",
-    height=150,
-    width=360,
-    drawing_mode="freedraw",
-    key="assinatura_canvas",
-)
+tela_assinatura = None
+if not sem_coleta:
+    st.subheader("Assinatura do gerador")
+    st.caption("Assine com o dedo dentro do quadro.")
+    tela_assinatura = st_canvas(
+        stroke_width=3,
+        stroke_color="#000000",
+        background_color="#FFFFFF",
+        height=150,
+        width=360,
+        drawing_mode="freedraw",
+        key="assinatura_canvas",
+    )
 
-finalizar = st.button("Finalizar coleta", type="primary", use_container_width=True)
+finalizar = st.button(
+    "Registrar visita sem coleta" if sem_coleta else "Finalizar coleta",
+    type="primary", use_container_width=True,
+)
 
 if finalizar:
     if not cliente:
         st.error("Selecione um cliente.")
-    elif not volume:
-        st.error("Informe o volume coletado.")
-    elif tela_assinatura.image_data is None:
+    elif sem_coleta and motivo == "Outro motivo" and not obs.strip():
+        st.error("Descreva o motivo nas observações.")
+    elif not sem_coleta and not volume:
+        st.error("Informe o volume coletado. Se não houve coleta, ative a opção 'Não houve coleta nesta visita'.")
+    elif not sem_coleta and tela_assinatura.image_data is None:
         st.error("Colete a assinatura do gerador.")
     else:
         canhoto = None
-        with st.spinner("Salvando a coleta..."):
+        with st.spinner("Salvando..."):
             try:
                 agora_dt = agora()
                 canhoto = proximo_id_coleta()
-
-                # assinatura: canvas (RGBA numpy) -> PNG
-                img_assinatura = Image.fromarray(tela_assinatura.image_data.astype("uint8"), "RGBA")
-                fundo = Image.new("RGBA", img_assinatura.size, (255, 255, 255, 255))
-                img_assinatura = Image.alpha_composite(fundo, img_assinatura).convert("RGB")
-                buffer_assinatura = io.BytesIO()
-                img_assinatura.save(buffer_assinatura, format="PNG")
-                assinatura_bytes = buffer_assinatura.getvalue()
                 foto_bytes = st.session_state.get("foto_bytes")
+                assinatura_bytes = None
+                pdf_bytes = None
+
+                if sem_coleta:
+                    anteriores = [
+                        r for r in registros_hoje.get(normalizar_codigo(cliente["CÓDIGO"]), [])
+                        if r["volume"] == 0
+                    ]
+                    obs_final = montar_obs_sem_coleta(motivo, obs, len(anteriores))
+                    volume_final = 0.0
+                    grupo_final = str(cliente.get("GRUPO RESÍDUO") or "")
+                else:
+                    # assinatura: canvas (RGBA numpy) -> PNG
+                    img_assinatura = Image.fromarray(tela_assinatura.image_data.astype("uint8"), "RGBA")
+                    fundo = Image.new("RGBA", img_assinatura.size, (255, 255, 255, 255))
+                    img_assinatura = Image.alpha_composite(fundo, img_assinatura).convert("RGB")
+                    buffer_assinatura = io.BytesIO()
+                    img_assinatura.save(buffer_assinatura, format="PNG")
+                    assinatura_bytes = buffer_assinatura.getvalue()
+                    obs_final, volume_final, grupo_final = obs, volume, grupo
 
                 dados_recibo = {
                     "id": canhoto,
                     "cliente": cliente["NOME PJ"],
                     "cnpj": cliente.get("CNPJ/CPF", ""),
-                    "volume": volume,
-                    "grupo": grupo,
-                    "obs": obs,
+                    "volume": volume_final,
+                    "grupo": grupo_final,
+                    "obs": obs_final,
                     "data_hora": formatar_data_hora(agora_dt),
+                    "sem_coleta": sem_coleta,
                 }
-                try:
-                    pdf_bytes = gerar_pdf(dados_recibo, assinatura_bytes, foto_bytes)
-                except Exception:
-                    pdf_bytes = None
+                if not sem_coleta:
+                    try:
+                        pdf_bytes = gerar_pdf(dados_recibo, assinatura_bytes, foto_bytes)
+                    except Exception:
+                        pdf_bytes = None
 
                 # assinatura, foto e PDF do canhoto vão para o Drive (em paralelo)
                 prefixo = f"canhoto_{canhoto}_cod{cliente['CÓDIGO']}_"
                 nome_pdf = f"canhoto_{canhoto}_{nome_arquivo_seguro(cliente.get('NOME FANTASIA') or cliente['NOME PJ'])}.pdf"
-                itens = [("assinatura", prefixo + "assinatura.png", assinatura_bytes, "image/png", None)]
+                itens = []
+                if assinatura_bytes:
+                    itens.append(("assinatura", prefixo + "assinatura.png", assinatura_bytes, "image/png", None))
                 if foto_bytes:
                     itens.append(("foto", prefixo + "foto.jpg", foto_bytes, "image/jpeg", None))
                 if pdf_bytes:
                     itens.append(("pdf", nome_pdf, pdf_bytes, "application/pdf", "Canhotos"))
-                links, avisos = enviar_anexos(itens)
+                links, avisos = enviar_anexos(itens) if itens else ({}, [])
 
                 hora_abertura = st.session_state["hora_abertura"] or agora_dt
                 nova_linha = [
@@ -638,9 +834,9 @@ if finalizar:
                     formatar_data(agora_dt),
                     cliente["CÓDIGO"],
                     cliente["NOME PJ"],
-                    volume,
-                    grupo,
-                    obs,
+                    volume_final,
+                    grupo_final,
+                    obs_final,
                     formatar_data_hora(hora_abertura),
                     formatar_data_hora(agora_dt),
                     links.get("assinatura", ""),
@@ -652,8 +848,9 @@ if finalizar:
                 # RAW: grava o texto exatamente como veio (sem interpretar fórmulas),
                 # já que o app é público e o campo de observações é livre.
                 aba_coletas.append_row(nova_linha, value_input_option="RAW")
+                registros_do_dia.clear()  # a lista do dia passa a mostrar o novo registro
 
-                if pdf_bytes is None:
+                if pdf_bytes is None and not sem_coleta:
                     avisos.append("Não foi possível gerar o PDF do canhoto.")
                 st.session_state["ultimo_recibo"] = {
                     "dados": dados_recibo,
