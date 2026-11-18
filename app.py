@@ -91,9 +91,6 @@ st.markdown("""
 div[data-testid="stForm"]{background:#fff;border-radius:16px;padding:18px;box-shadow:0 1px 2px rgba(16,24,20,.05),0 8px 20px rgba(16,24,20,.06);}
 .cartao-cliente{background:var(--verde-suave);border-radius:14px;padding:14px;margin:8px 0 4px}
 .rotulo-dia{text-align:center;font-weight:700;padding-top:.55rem;color:#151B18}
-/* mantém as colunas lado a lado no celular (setas do dia, volume/grupo) */
-div[data-testid="stHorizontalBlock"]{flex-wrap:nowrap !important;gap:.5rem}
-div[data-testid="column"]{min-width:0 !important;flex:1 1 0 !important;width:auto !important}
 .cartao-cliente, .cartao-cliente b{color:#151B18}
 .cartao-cliente b{font-size:15px}
 .stButton>button, .stDownloadButton>button{
@@ -371,10 +368,16 @@ def registros_seguro(data_iso):
         return {}
 
 
+def e_sem_coleta(obs):
+    """Visita sem coleta (cliente fechado etc.) começa com FECHADO ou SEM COLETA.
+    Zero litros com outra observação (ou sem nenhuma) = cliente sem resíduo."""
+    return str(obs or "").strip().upper().startswith(("FECHADO", "SEM COLETA"))
+
+
 def montar_obs_sem_coleta(motivo, obs_digitada, visitas_sem_coleta_antes):
     obs_digitada = (obs_digitada or "").strip()
     if motivo == "Outro motivo":
-        return obs_digitada
+        return f"SEM COLETA - {obs_digitada}" if obs_digitada else "SEM COLETA"
     texto = "FECHADO"
     if visitas_sem_coleta_antes:
         texto += f" {visitas_sem_coleta_antes + 1}ª VISITA"
@@ -559,14 +562,14 @@ cliente = achar_cliente(st.session_state.get("cliente_agenda"))
 if cliente is None:
     st.session_state["cliente_agenda"] = None
 
-    # ---- Coletas previstas (Google Agenda), com navegação entre os dias ----
+    # ---- Coletas previstas (Google Agenda), com navegação entre dias ----
+    st.subheader("Coletas previstas")
     hoje = agora().date()
     dia = date.fromisoformat(st.session_state["agenda_data"])
-    st.subheader("Coletas previstas")
-    col_ant, col_dia, col_prox = st.columns([1, 3, 1])
-    col_ant.button("◀", key="dia_anterior", on_click=mudar_dia, args=(-1,), use_container_width=True)
-    col_dia.markdown(f'<div class="rotulo-dia">{rotulo_dia(dia, hoje)}</div>', unsafe_allow_html=True)
-    col_prox.button("▶", key="dia_seguinte", on_click=mudar_dia, args=(1,), use_container_width=True)
+    st.markdown(f'<div class="rotulo-dia">{rotulo_dia(dia, hoje)}</div>', unsafe_allow_html=True)
+    nav_esq, nav_dir = st.columns(2)
+    nav_esq.button("◀ Dia anterior", key="dia_anterior", on_click=mudar_dia, args=(-1,), use_container_width=True)
+    nav_dir.button("Dia seguinte ▶", key="dia_seguinte", on_click=mudar_dia, args=(1,), use_container_width=True)
     if dia != hoje:
         st.button("Voltar para hoje", key="voltar_hoje", on_click=voltar_hoje, use_container_width=True)
     try:
@@ -575,47 +578,49 @@ if cliente is None:
         except Exception:
             agenda_id = AGENDA_CLIENTES_ID
         eventos = carregar_agenda_do_dia(dia.isoformat(), agenda_id)
-        if dia == hoje:
-            marcas = registros_hoje
-        elif dia < hoje:
-            marcas = registros_seguro(dia.isoformat())
-        else:
-            marcas = {}  # dia futuro: ainda não há o que marcar
+        marcas = {}
+        if dia <= hoje:
+            try:
+                marcas = registros_do_dia(dia.isoformat())
+            except Exception:
+                marcas = {}
         previstos, sem_cadastro = [], []
         for ev in eventos:
             cli = achar_cliente(ev["codigo"]) if ev["codigo"] else None
             (previstos if cli else sem_cadastro).append((ev, cli))
         if not eventos:
-            st.caption("Nenhuma coleta agendada neste dia.")
+            st.caption("Nenhuma coleta agendada neste dia na agenda.")
         feitas = 0
         for i, (ev, cli) in enumerate(previstos):
             regs = marcas.get(normalizar_codigo(cli["CÓDIGO"]), [])
-            coletou = [r for r in regs if r["volume"] > 0]
-            base = f'{cli["CÓDIGO"]} — {cli["NOME PJ"]}'
-            hora = f'{ev["hora"]} · ' if ev["hora"] else ""
-            if coletou:
+            feitos = [r for r in regs if not e_sem_coleta(r["obs"])]
+            nome = f'{cli["CÓDIGO"]} — {cli["NOME PJ"]}'
+            hora_ev = f'{ev["hora"]} · ' if ev["hora"] else ""
+            if feitos:
+                # coleta realizada: botão verde com ✅
+                rotulo = f'✅ {hora_ev}{nome} · {formatar_litros(sum(r["volume"] for r in feitos))} L'
+                tipo = "primary"
                 feitas += 1
-                rotulo = f'✅ {hora}{base} · {formatar_litros(sum(r["volume"] for r in coletou))} L'
-                tipo = "secondary"
             elif regs:
-                rotulo = f'↩ {hora}{base} · {(regs[-1]["obs"] or "sem coleta")[:22]}'
+                motivo_ant = (regs[-1]["obs"] or "sem coleta")[:22]
+                rotulo = f"🟠 {hora_ev}{nome} · {motivo_ant} (voltar)"
                 tipo = "secondary"
             else:
-                rotulo = f"{hora}{base}"
-                tipo = "primary"
+                rotulo = f"{hora_ev}{nome}"
+                tipo = "secondary"
             st.button(
-                rotulo, key=f"agenda_{i}_{cli['CÓDIGO']}", type=tipo, use_container_width=True,
-                on_click=escolher_pela_agenda, args=(cli["CÓDIGO"],),
+                rotulo, key=f"agenda_{dia.isoformat()}_{i}_{cli['CÓDIGO']}", type=tipo,
+                use_container_width=True, on_click=escolher_pela_agenda, args=(cli["CÓDIGO"],),
             )
         if previstos and dia <= hoje:
-            st.caption(f"{feitas} de {len(previstos)} coletas realizadas · ↩ = visita sem coleta, precisa voltar")
-        elif previstos:
-            st.caption("Antecipando uma coleta de outro dia: ela será registrada com a data de hoje.")
+            st.caption(f"{feitas} de {len(previstos)} coletas realizadas · ✅ coletado · 🟠 fechado, precisa voltar")
+        if dia > hoje:
+            st.caption("Agenda de outro dia: a coleta será registrada com a data de hoje.")
         for ev, _ in sem_cadastro:
             st.caption(f'Na agenda, sem cadastro no sistema: {ev["titulo"]}')
     except Exception:
         st.caption(
-            "Não consegui ler a agenda deste dia. Se for a primeira vez, confira se a agenda "
+            "Não consegui ler a agenda. Se for a primeira vez, confira se a agenda "
             "'LRS CLIENTES' foi compartilhada com a conta de serviço."
         )
 
@@ -671,7 +676,7 @@ if cliente:
     """, unsafe_allow_html=True)
     regs_cliente = registros_hoje.get(normalizar_codigo(cliente["CÓDIGO"]), [])
     if regs_cliente:
-        coletado = [r for r in regs_cliente if r["volume"] > 0]
+        coletado = [r for r in regs_cliente if not e_sem_coleta(r["obs"])]
         if coletado:
             st.info(
                 f"Hoje já foi registrada coleta deste cliente: "
@@ -689,22 +694,20 @@ st.divider()
 # ----------------------------------------------------------------------
 # Formulário da coleta
 # ----------------------------------------------------------------------
-sem_coleta = st.toggle("Não houve coleta nesta visita (fechado etc.)")
-motivo = None
+sem_coleta = st.toggle("Cliente fechado ou não atendeu (visita sem coleta)")
+motivo = "Fechado"
 if sem_coleta:
     st.subheader("Visita sem coleta")
     motivo = st.radio("Motivo", ["Fechado", "Outro motivo"], horizontal=True)
     volume, grupo = 0.0, ""
-    obs = st.text_area(
-        "Observações", placeholder="Se for 'Outro motivo', descreva aqui o que aconteceu."
-    )
+    obs = st.text_area("Observações", placeholder="Se for \"Outro motivo\", descreva aqui o que aconteceu.")
 else:
     st.subheader("Dados da coleta")
-    col1, col2 = st.columns(2)
-    with col1:
-        volume = st.number_input("Volume coletado (L)", min_value=0.0, step=1.0, format="%.1f")
-    with col2:
-        grupo = st.selectbox("Grupo de resíduo", ["", "A", "B", "E", "A-E", "A-B", "A-B-E", "Outros"])
+    volume = st.number_input(
+        "Volume coletado (L)", min_value=0.0, value=None, step=1.0, format="%.1f",
+        placeholder="Ex.: 20  (se o cliente não tem resíduo, digite 0)",
+    )
+    grupo = st.selectbox("Grupo de resíduo", ["", "A", "B", "E", "A-E", "A-B", "A-B-E", "Outros"])
     obs = st.text_area("Observações", placeholder="Ex.: coleta normal, excedente, irregularidade...")
 
 st.subheader("Foto (opcional)")
@@ -768,8 +771,8 @@ if finalizar:
         st.error("Selecione um cliente.")
     elif sem_coleta and motivo == "Outro motivo" and not obs.strip():
         st.error("Descreva o motivo nas observações.")
-    elif not sem_coleta and not volume:
-        st.error("Informe o volume coletado. Se não houve coleta, ative a opção 'Não houve coleta nesta visita'.")
+    elif not sem_coleta and volume is None:
+        st.error("Informe o volume coletado. Se o cliente não tem resíduo, digite 0. Se estava fechado, ative a opção de visita sem coleta.")
     elif not sem_coleta and tela_assinatura.image_data is None:
         st.error("Colete a assinatura do gerador.")
     else:
@@ -785,7 +788,7 @@ if finalizar:
                 if sem_coleta:
                     anteriores = [
                         r for r in registros_hoje.get(normalizar_codigo(cliente["CÓDIGO"]), [])
-                        if r["volume"] == 0
+                        if e_sem_coleta(r["obs"])
                     ]
                     obs_final = montar_obs_sem_coleta(motivo, obs, len(anteriores))
                     volume_final = 0.0
